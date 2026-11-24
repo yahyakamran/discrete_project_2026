@@ -2,15 +2,17 @@
 CS1005 Discrete Structures - Fall 2026 - Course Project
 Finding Network Motifs in an Email Network (SNAP email-Eu-core)
 
-Step 1 (T1, T2): load and clean the data, derive parameters, build subgraphs.
+Step 2 (T3, T4): triad classification and the 13-class triad census.
+(Builds on step 1: data loading, parameters, subgraphs.)
 
 Usage:
-    python motifs.py --digits 1234 4567 0890
     python motifs.py --R 6691
+    python motifs.py --R 6691 --no-verify    # skip the networkx cross-check
 """
 
 import argparse
 import gzip
+import itertools
 import os
 import shutil
 import ssl
@@ -28,6 +30,55 @@ DEPTS_URL = "https://snap.stanford.edu/data/email-Eu-core-department-labels.txt.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EDGES_FILE = os.path.join(BASE_DIR, "email-Eu-core.txt.gz")
 DEPTS_FILE = os.path.join(BASE_DIR, "email-Eu-core-department-labels.txt.gz")
+
+# Triad classes: bit k of the 6-bit code is 1 when the k-th edge below is present.
+#   bit:   0     1     2     3     4     5
+#   edge: 0->1  0->2  1->0  1->2  2->0  2->1
+EDGE_BIT = {(0, 1): 0, (0, 2): 1, (1, 0): 2, (1, 2): 3, (2, 0): 4, (2, 1): 5}
+
+CONNECTED_CODES = [3, 6, 7, 10, 11, 15, 21, 23, 25, 27, 30, 31, 63]
+CODE_TO_CLASS = {code: k + 1 for k, code in enumerate(CONNECTED_CODES)}
+
+PERMS = list(itertools.permutations(range(3)))  # the 6 orderings
+
+
+# ---------------------------------------------------------------------------
+# T3: triad class (64 labelled -> 16 orbits -> 13 connected classes)
+# ---------------------------------------------------------------------------
+def code_of_ordering(present, order):
+    """6-bit code of the triad when the nodes are listed in `order`.
+
+    present : set of directed pairs (i, j) over positions {0,1,2}
+              describing which edges exist among the three nodes,
+              indexed by the *original* position.
+    order   : a permutation; position p of the new ordering holds original node order[p].
+    """
+    code = 0
+    for (p, q), bit in EDGE_BIT.items():
+        if (order[p], order[q]) in present:
+            code |= 1 << bit
+    return code
+
+
+def canonical_code(present):
+    """Minimum 6-bit code over all 6 orderings (the orbit representative)."""
+    return min(code_of_ordering(present, order) for order in PERMS)
+
+
+def triad_class(a, b, c, out):
+    """Return the class 1..13 of the triad on nodes a, b, c, or None if disconnected.
+
+    `out` maps node -> set of out-neighbours (the adjacency of G).
+    Steps: 64 labelled configurations -> canonical code (16 orbits) -> 13 connected classes.
+    """
+    nodes = (a, b, c)
+    present = set()
+    for i in range(3):
+        for j in range(3):
+            if i != j and nodes[j] in out.get(nodes[i], ()):
+                present.add((i, j))
+    code = canonical_code(present)
+    return CODE_TO_CLASS.get(code)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +170,70 @@ def induced_subgraph(edge_set, dept_of, dept):
 
 
 # ---------------------------------------------------------------------------
+# Adjacency helper
+# ---------------------------------------------------------------------------
+def build_adjacency(edges):
+    out = defaultdict(set)
+    inn = defaultdict(set)
+    for u, v in edges:
+        out[u].add(v)
+        inn[v].add(u)
+    return out, inn
+
+
+# ---------------------------------------------------------------------------
+# T4: triad census (no C(|V|,3) enumeration)
+# ---------------------------------------------------------------------------
+def triad_census(edges):
+    """Return [N1..N13]. Each connected 3-subset is counted exactly once.
+
+    Every connected triple has a node adjacent to the other two. For each node v we
+    enumerate pairs of its neighbours (in or out) and collect the sorted triple in a set,
+    which removes duplicates produced by the other 'centres' of the same triple.
+    """
+    out, inn = build_adjacency(edges)
+    nodes = set(out) | set(inn)
+    triples = set()
+    for v in nodes:
+        nbrs = sorted(out.get(v, set()) | inn.get(v, set()))
+        for a, b in itertools.combinations(nbrs, 2):
+            triples.add(tuple(sorted((v, a, b))))
+    counts = [0] * 13
+    for a, b, c in triples:
+        k = triad_class(a, b, c, out)
+        assert k is not None, "a triple built from neighbour pairs must be connected"
+        counts[k - 1] += 1
+    return counts
+
+
+# ---------------------------------------------------------------------------
+# Cross-check against networkx (allowed ONLY to verify T4)
+# ---------------------------------------------------------------------------
+def verify_with_networkx(edges, counts):
+    try:
+        import networkx as nx
+    except ImportError:
+        print("networkx not installed; skipping cross-check.")
+        return None
+    # Map each of our 13 classes to networkx's triad name via a representative graph.
+    inv_bit = {bit: e for e, bit in EDGE_BIT.items()}
+    class_to_name = {}
+    for k, code in enumerate(CONNECTED_CODES, start=1):
+        g = nx.DiGraph()
+        g.add_nodes_from(range(3))
+        for bit in range(6):
+            if code >> bit & 1:
+                g.add_edge(*inv_bit[bit])
+        class_to_name[k] = nx.triad_type(g)
+    G = nx.DiGraph()
+    G.add_edges_from(edges)
+    census = nx.triadic_census(G)
+    ok = all(census[class_to_name[k]] == counts[k - 1] for k in range(1, 14))
+    print("nx.triadic_census cross-check:", "PASS" if ok else "FAIL")
+    return ok
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 def main():
@@ -132,6 +247,7 @@ def main():
     g.add_argument("--digits", nargs="+", help="last-4-digit part of each member's roll number")
     ap.add_argument("--networks", type=int, help="override #random networks (smoke test only)")
     ap.add_argument("--attempts-factor", type=int, help="override swap factor (smoke test only)")
+    ap.add_argument("--no-verify", action="store_true", help="skip networkx cross-check")
     args = ap.parse_args()
 
     R = args.R if args.R is not None else sum(int(d) for d in args.digits)
@@ -163,10 +279,24 @@ def main():
     print(f"Seed                   = {params['seed']}")
     print("Top-20 (dept: internal edges):", [(d, internal[d]) for d in top20])
 
-    # --- T2 ---
+    # --- T3 hand example (can be shown in the video) ---
+    demo_out = {0: {1, 2}, 1: set(), 2: set()}
+    print("\nT3 example: edges 0->1, 0->2 -> class", triad_class(0, 1, 2, demo_out),
+          "(code 3 -> class 1)")
+
+    # --- T2, T4 ---
+    results = {}
     for label, dept in (("A", deptA), ("B", deptB)):
         members, edges = induced_subgraph(edge_set, dept_of, dept)
-        print(f"[{label}] department {dept}: {len(members)} nodes, {len(edges)} edges")
+        print(f"\n[{label}] department {dept}: {len(members)} nodes, {len(edges)} edges")
+        results[label] = triad_census(edges)
+        if not args.no_verify:
+            verify_with_networkx(edges, results[label])
+
+    print("\n=== T4: real counts ===")
+    print(f"{'Class':>5} {'Dept '+str(deptA):>10} {'Dept '+str(deptB):>10}")
+    for k in range(13):
+        print(f"{k+1:>5} {results['A'][k]:>10} {results['B'][k]:>10}")
 
 
 if __name__ == "__main__":
