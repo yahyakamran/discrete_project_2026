@@ -2,20 +2,22 @@
 CS1005 Discrete Structures - Fall 2026 - Course Project
 Finding Network Motifs in an Email Network (SNAP email-Eu-core)
 
-Step 2 (T3, T4): triad classification and the 13-class triad census.
-(Builds on step 1: data loading, parameters, subgraphs.)
+Step 3 (T5, T6): degree-preserving randomisation and Z-scores.
+(Builds on steps 1-2.)
 
 Usage:
     python motifs.py --R 6691
-    python motifs.py --R 6691 --no-verify    # skip the networkx cross-check
+    python motifs.py --R 6691 --networks 3 --attempts-factor 1   # quick smoke test
 """
 
 import argparse
 import gzip
 import itertools
 import os
+import random
 import shutil
 import ssl
+import statistics
 import sys
 import tempfile
 import urllib.error
@@ -207,6 +209,90 @@ def triad_census(edges):
 
 
 # ---------------------------------------------------------------------------
+# T5: double-edge-swap randomisation
+# ---------------------------------------------------------------------------
+def degree_sequences(edges):
+    outd, ind = defaultdict(int), defaultdict(int)
+    for u, v in edges:
+        outd[u] += 1
+        ind[v] += 1
+    return dict(outd), dict(ind)
+
+
+def randomize(edges, attempts, seed):
+    """Return a randomised copy of `edges` after `attempts` swap attempts.
+
+    One attempt: pick edges (a,b),(c,d) uniformly from the current edge list and
+    replace them with (a,d),(c,b). Reject (no change) if a==d, c==b, (a,d) in E or
+    (c,b) in E. Rejected attempts still count. `seed` may be an int or a random.Random.
+    The two edges are drawn as two distinct list positions.
+    """
+    rng = seed if isinstance(seed, random.Random) else random.Random(seed)
+    edge_list = list(edges)
+    edge_set = set(edge_list)
+    m = len(edge_list)
+    orig_out, orig_in = degree_sequences(edge_list)
+
+    if m >= 2:
+        for _ in range(attempts):
+            i = rng.randrange(m)
+            j = rng.randrange(m - 1)
+            if j >= i:
+                j += 1  # uniform over positions != i
+            a, b = edge_list[i]
+            c, d = edge_list[j]
+            if a == d or c == b:
+                continue
+            if (a, d) in edge_set or (c, b) in edge_set:
+                continue
+            edge_set.discard((a, b))
+            edge_set.discard((c, d))
+            edge_set.add((a, d))
+            edge_set.add((c, b))
+            edge_list[i] = (a, d)
+            edge_list[j] = (c, b)
+
+    new_out, new_in = degree_sequences(edge_list)
+    assert len(edge_set) == len(edge_list) == len(edges), "graph must stay simple, same size"
+    assert new_out == orig_out, "out-degrees changed!"
+    assert new_in == orig_in, "in-degrees changed!"
+    assert all(u != v for u, v in edge_list), "self-loop introduced!"
+    return edge_list
+
+
+# ---------------------------------------------------------------------------
+# T6: Z-scores
+# ---------------------------------------------------------------------------
+def z_scores(real_counts, random_counts):
+    """random_counts: list of 13-vectors (one per random graph). Population std."""
+    z, mu, sd = [], [], []
+    for k in range(13):
+        sample = [rc[k] for rc in random_counts]
+        m = statistics.fmean(sample)
+        s = statistics.pstdev(sample)
+        mu.append(m)
+        sd.append(s)
+        z.append(0.0 if s == 0 else (real_counts[k] - m) / s)
+    return z, mu, sd
+
+
+def run_department(edge_set, dept_of, dept, params, rng, label):
+    members, edges = induced_subgraph(edge_set, dept_of, dept)
+    print(f"\n[{label}] department {dept}: {len(members)} nodes, {len(edges)} edges")
+    real = triad_census(edges)
+    attempts = params["attempts_factor"] * len(edges)
+    rand_counts = []
+    for r in range(params["num_networks"]):
+        g = randomize(edges, attempts, rng)  # starts from the ORIGINAL edges each time
+        rand_counts.append(triad_census(g))
+        if (r + 1) % 10 == 0 or r + 1 == params["num_networks"]:
+            print(f"   random networks done: {r + 1}/{params['num_networks']}")
+    z, mu, sd = z_scores(real, rand_counts)
+    return {"dept": dept, "nodes": len(members), "edges": len(edges),
+            "real": real, "mu": mu, "sd": sd, "z": z}
+
+
+# ---------------------------------------------------------------------------
 # Cross-check against networkx (allowed ONLY to verify T4)
 # ---------------------------------------------------------------------------
 def verify_with_networkx(edges, counts):
@@ -284,19 +370,26 @@ def main():
     print("\nT3 example: edges 0->1, 0->2 -> class", triad_class(0, 1, 2, demo_out),
           "(code 3 -> class 1)")
 
-    # --- T2, T4 ---
-    results = {}
-    for label, dept in (("A", deptA), ("B", deptB)):
-        members, edges = induced_subgraph(edge_set, dept_of, dept)
-        print(f"\n[{label}] department {dept}: {len(members)} nodes, {len(edges)} edges")
-        results[label] = triad_census(edges)
-        if not args.no_verify:
-            verify_with_networkx(edges, results[label])
+    # --- T2, T4-T6 ---
+    rng = random.Random(params["seed"])  # one generator seeded with R for the whole run
+    resA = run_department(edge_set, dept_of, deptA, params, rng, "A")
+    resB = run_department(edge_set, dept_of, deptB, params, rng, "B")
+
+    if not args.no_verify:
+        for res in (resA, resB):
+            _, edges = induced_subgraph(edge_set, dept_of, res["dept"])
+            verify_with_networkx(edges, res["real"])
 
     print("\n=== T4: real counts ===")
     print(f"{'Class':>5} {'Dept '+str(deptA):>10} {'Dept '+str(deptB):>10}")
     for k in range(13):
-        print(f"{k+1:>5} {results['A'][k]:>10} {results['B'][k]:>10}")
+        print(f"{k+1:>5} {resA['real'][k]:>10} {resB['real'][k]:>10}")
+
+    print("\n=== T6: Z-scores (motif: Z>2, anti-motif: Z<-2) ===")
+    print(f"{'Class':>5} {'Z(A)':>9} {'Z(B)':>9}  A-flag  B-flag")
+    flag = lambda z: "motif" if z > 2 else ("anti" if z < -2 else "-")
+    for k in range(13):
+        print(f"{k+1:>5} {resA['z'][k]:>9.2f} {resB['z'][k]:>9.2f}  {flag(resA['z'][k]):>6}  {flag(resB['z'][k]):>6}")
 
 
 if __name__ == "__main__":
