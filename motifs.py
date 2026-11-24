@@ -2,12 +2,19 @@
 CS1005 Discrete Structures - Fall 2026 - Course Project
 Finding Network Motifs in an Email Network (SNAP email-Eu-core)
 
-Step 3 (T5, T6): degree-preserving randomisation and Z-scores.
-(Builds on steps 1-2.)
+BENCHMARK / REFERENCE IMPLEMENTATION (instructor use)
 
 Usage:
-    python motifs.py --R 6691
-    python motifs.py --R 6691 --networks 3 --attempts-factor 1   # quick smoke test
+    python motifs.py --digits 1234 4567 0890        # last-4-digit blocks of each roll number
+    python motifs.py --R 6691                       # or give R directly
+    python motifs.py --R 6691 --networks 5 --attempts-factor 1   # quick smoke test
+
+Data files (downloaded automatically if missing):
+    email-Eu-core.txt.gz
+    email-Eu-core-department-labels.txt.gz
+
+Only the standard library (+ matplotlib for the chart) is used for the core tasks.
+networkx is imported ONLY inside verify_with_networkx(), as a cross-check of T4.
 """
 
 import argparse
@@ -15,9 +22,9 @@ import gzip
 import itertools
 import os
 import random
+import statistics
 import shutil
 import ssl
-import statistics
 import sys
 import tempfile
 import urllib.error
@@ -26,14 +33,16 @@ from collections import defaultdict
 
 EDGES_URL = "https://snap.stanford.edu/data/email-Eu-core.txt.gz"
 DEPTS_URL = "https://snap.stanford.edu/data/email-Eu-core-department-labels.txt.gz"
-
-# Data files live next to this script, so the program behaves the same on Windows,
-# macOS and Linux no matter which folder it is launched from.
+# Data files and the default chart live next to this script, so the program behaves the
+# same on Windows, macOS and Linux no matter which folder it is launched from.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 EDGES_FILE = os.path.join(BASE_DIR, "email-Eu-core.txt.gz")
 DEPTS_FILE = os.path.join(BASE_DIR, "email-Eu-core-department-labels.txt.gz")
 
-# Triad classes: bit k of the 6-bit code is 1 when the k-th edge below is present.
+# ---------------------------------------------------------------------------
+# Triad classes (Section 2 of the handout)
+# ---------------------------------------------------------------------------
+# Bit k of the code is 1 when the k-th edge below is present.
 #   bit:   0     1     2     3     4     5
 #   edge: 0->1  0->2  1->0  1->2  2->0  2->1
 EDGE_BIT = {(0, 1): 0, (0, 2): 1, (1, 0): 2, (1, 2): 3, (2, 0): 4, (2, 1): 5}
@@ -44,9 +53,6 @@ CODE_TO_CLASS = {code: k + 1 for k, code in enumerate(CONNECTED_CODES)}
 PERMS = list(itertools.permutations(range(3)))  # the 6 orderings
 
 
-# ---------------------------------------------------------------------------
-# T3: triad class (64 labelled -> 16 orbits -> 13 connected classes)
-# ---------------------------------------------------------------------------
 def code_of_ordering(present, order):
     """6-bit code of the triad when the nodes are listed in `order`.
 
@@ -80,7 +86,7 @@ def triad_class(a, b, c, out):
             if i != j and nodes[j] in out.get(nodes[i], ()):
                 present.add((i, j))
     code = canonical_code(present)
-    return CODE_TO_CLASS.get(code)
+    return CODE_TO_CLASS.get(code)  # None -> disconnected orbit
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +178,7 @@ def induced_subgraph(edge_set, dept_of, dept):
 
 
 # ---------------------------------------------------------------------------
-# Adjacency helper
+# Adjacency helpers
 # ---------------------------------------------------------------------------
 def build_adjacency(edges):
     out = defaultdict(set)
@@ -293,7 +299,33 @@ def run_department(edge_set, dept_of, dept, params, rng, label):
 
 
 # ---------------------------------------------------------------------------
-# Cross-check against networkx (allowed ONLY to verify T4)
+# T7: chart
+# ---------------------------------------------------------------------------
+def plot_z(resA, resB, R, path):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    x = list(range(1, 14))
+    w = 0.38
+    fig, ax = plt.subplots(figsize=(11, 5.5))
+    ax.bar([i - w / 2 for i in x], resA["z"], w, label=f"Dept A = {resA['dept']}")
+    ax.bar([i + w / 2 for i in x], resB["z"], w, label=f"Dept B = {resB['dept']}")
+    ax.axhline(2, linestyle="--", color="black", linewidth=1)
+    ax.axhline(-2, linestyle="--", color="black", linewidth=1)
+    ax.axhline(0, color="grey", linewidth=0.6)
+    ax.set_xticks(x)
+    ax.set_xlabel("Triad class")
+    ax.set_ylabel("Z-score")
+    ax.set_title(f"Triad-class Z-scores, Dept {resA['dept']} vs Dept {resB['dept']} (R = {R})")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    print(f"Saved chart -> {path}")
+
+
+# ---------------------------------------------------------------------------
+# Cross-check against networkx (allowed ONLY to verify T4; class order differs)
 # ---------------------------------------------------------------------------
 def verify_with_networkx(edges, counts):
     try:
@@ -333,6 +365,8 @@ def main():
     g.add_argument("--digits", nargs="+", help="last-4-digit part of each member's roll number")
     ap.add_argument("--networks", type=int, help="override #random networks (smoke test only)")
     ap.add_argument("--attempts-factor", type=int, help="override swap factor (smoke test only)")
+    ap.add_argument("--out", default=os.path.join(BASE_DIR, "zscores.png"),
+                    help="chart file (default: zscores.png next to this script)")
     ap.add_argument("--no-verify", action="store_true", help="skip networkx cross-check")
     args = ap.parse_args()
 
@@ -365,7 +399,7 @@ def main():
     print(f"Seed                   = {params['seed']}")
     print("Top-20 (dept: internal edges):", [(d, internal[d]) for d in top20])
 
-    # --- T3 hand example (can be shown in the video) ---
+    # --- T3 hand example (printed so it can be shown in the video) ---
     demo_out = {0: {1, 2}, 1: set(), 2: set()}
     print("\nT3 example: edges 0->1, 0->2 -> class", triad_class(0, 1, 2, demo_out),
           "(code 3 -> class 1)")
@@ -390,6 +424,8 @@ def main():
     flag = lambda z: "motif" if z > 2 else ("anti" if z < -2 else "-")
     for k in range(13):
         print(f"{k+1:>5} {resA['z'][k]:>9.2f} {resB['z'][k]:>9.2f}  {flag(resA['z'][k]):>6}  {flag(resB['z'][k]):>6}")
+
+    plot_z(resA, resB, R, args.out)
 
 
 if __name__ == "__main__":
